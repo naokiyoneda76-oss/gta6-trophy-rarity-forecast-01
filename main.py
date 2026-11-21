@@ -114,6 +114,7 @@ def forecast(case):
     last_read = history[-1]
     per_trophy = []
     slopes = []
+    linear_slopes = []
     last_logits = []
 
     # Build time and player-count regressions independently for each trophy.
@@ -141,6 +142,8 @@ def forecast(case):
                 ppts.append((math.log(float(nplayers)), value, weights[j]))
         pts = choose_window(pts)
         a, b, resid, se = weighted_line(pts)
+        linear_pts = [(math.expm1(x), value, weight) for x, value, weight in pts]
+        linear_a, linear_b, linear_resid, _ = weighted_line(linear_pts)
         latest_rate = last_read.get("rates", [None] * len(trophies))
         raw_last = latest_rate[i] if i < len(latest_rate) else None
         if raw_last is not None:
@@ -149,11 +152,14 @@ def forecast(case):
         else:
             last_value = None
         per_trophy.append({"points": pts, "a": a, "b": b, "resid": resid, "se": se,
+                           "linear_a": linear_a, "linear_b": linear_b, "linear_resid": linear_resid,
                            "last": last_value, "ppts": ppts})
         if len(pts) >= 2:
             slopes.append(b)
+            linear_slopes.append(linear_b)
 
     median_slope = median(slopes) if slopes else 0.0
+    median_linear_slope = median(linear_slopes) if linear_slopes else 0.0
     fallback_last = median(last_logits) if last_logits else logit(1.0)
     rows = []
     for i, (trophy, model) in enumerate(zip(trophies, per_trophy)):
@@ -172,13 +178,19 @@ def forecast(case):
             shrunk_b = min(3.5, max(-2.0, weight * model["b"] + (1.0 - weight) * median_slope))
             # Express both views as moves from the last observed logit.
             time_move = shrunk_b * dx
-            blended_move = time_move
+            hours_ahead = max(0.0, math.expm1(target_x) - math.expm1(last_x))
+            shrunk_linear_b = min(3.5, max(-2.0, weight * model["linear_b"] + (1.0 - weight) * median_linear_slope))
+            linear_move = shrunk_linear_b * hours_ahead
+            # Log-time fits decelerating growth; linear-time fits a steady per-hour logit climb. Extrapolate with the better-fitting transform.
+            use_linear = model["linear_resid"] < model["resid"]
+            picked_move = linear_move if use_linear else time_move
+            blended_move = picked_move
             if len(model["ppts"]) >= 4 and varied_players:
                 _, pb, _, _ = weighted_line(model["ppts"])
                 player_move = pb * (math.log(predicted_players) - math.log(last_players))
-                blended_move = 0.5 * (time_move + player_move)
+                blended_move = 0.5 * (picked_move + player_move)
             # Chosen for robustness across synthetic scenarios, not fitted to one seed.
-            median_value = last + 0.45 * blended_move
+            median_value = last + (1.00 if use_linear else 0.45) * blended_move
 
         median_value = min(logit(99.9), max(logit(0.01), median_value))
         center = logistic(median_value)
