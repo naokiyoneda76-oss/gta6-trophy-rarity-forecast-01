@@ -168,7 +168,8 @@ def forecast(case):
         last = model["last"] if model["last"] is not None else fallback_last
         dx = max(0.0, target_x - last_x)
         sigma = math.sqrt(base_sigma * base_sigma + model["resid"] ** 2 + (dx * model["se"]) ** 2)
-        sigma = min(1.7, max(0.20, sigma))
+        # Calibrated on synthetic scenarios: unscaled spread covered ~100% of outcomes where ~90% is honest.
+        sigma = min(1.7, max(0.20, sigma * 0.65))
 
         if n < 3:
             median_value = last
@@ -190,7 +191,7 @@ def forecast(case):
                 player_move = pb * (math.log(predicted_players) - math.log(last_players))
                 blended_move = 0.5 * (picked_move + player_move)
             # Chosen for robustness across synthetic scenarios, not fitted to one seed.
-            median_value = last + (1.00 if use_linear else 0.45) * blended_move
+            median_value = last + (1.00 if use_linear else 0.35) * blended_move
 
         median_value = min(logit(99.9), max(logit(0.01), median_value))
         center = logistic(median_value)
