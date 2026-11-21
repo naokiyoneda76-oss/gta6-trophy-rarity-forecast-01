@@ -236,8 +236,12 @@ def forecast(case):
                 _, pb, _, _ = weighted_line(model["ppts"])
                 player_move = pb * (math.log(predicted_players) - math.log(last_players))
                 blended_move = 0.5 * (picked_move + player_move)
+            ceiling_fit_pts = pts
+            if n > 48:
+                sample_indices = [round(i * (n - 1) / 47) for i in range(48)]
+                ceiling_fit_pts = [pts[index] for index in sample_indices]
             ceiling_points = [(math.expm1(x) / 24.0, logistic(value), point_weight)
-                              for x, value, point_weight in pts]
+                              for x, value, point_weight in ceiling_fit_pts]
             ceiling = fit_ceiling(ceiling_points, max(0.0, math.expm1(target_x) / 24.0)) if n >= 4 else None
             ceiling_wins = ceiling is not None and ceiling[4] < (model["linear_resid"] if use_linear else model["resid"])
             if ceiling_wins:
@@ -248,7 +252,6 @@ def forecast(case):
             else:
                 # Chosen for robustness across synthetic scenarios, not fitted to one seed.
                 median_value = last + (0.85 if use_linear else 0.35) * blended_move
-
         median_value = min(logit(99.9), max(logit(0.01), median_value))
         center = logistic(median_value)
         qs = []
