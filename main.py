@@ -85,6 +85,30 @@ def choose_window(points):
     return recent if len(recent) >= 5 and len(points) > len(recent) else points
 
 
+def fit_ceiling(points, target_days):
+    """Grid-fit a saturating rate curve, scoring in logit space."""
+    best = None
+    for a in (0.6, 0.8, 1.0, 1.2, 1.5):
+        for k in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2):
+            factors = [1.0 - math.exp(-k * days ** a) for days, _, _ in points]
+            denom = sum(weight * factor * factor for factor, (_, _, weight) in zip(factors, points))
+            if denom <= 0:
+                continue
+            c = sum(weight * factor * rate for factor, (_, rate, weight) in zip(factors, points)) / denom
+            if c <= 0:
+                continue
+            sse = sum(weight * (logit(min(99.9, max(0.01, c * factor))) - logit(rate)) ** 2
+                      for factor, (_, rate, weight) in zip(factors, points))
+            if best is None or sse < best[3]:
+                best = (c, k, a, sse)
+    if best is None:
+        return None
+    c, k, a, sse = best
+    residual = math.sqrt(sse / sum(weight for _, _, weight in points))
+    predicted = min(99.9, max(0.01, c * (1.0 - math.exp(-k * target_days ** a))))
+    return c, k, a, sse, residual, predicted
+
+
 def round4(value):
     # Positive values only: floor(x + .5) implements the requested half-up rounding.
     return math.floor(value * 10000.0 + 0.5) / 10000.0
@@ -130,6 +154,7 @@ def forecast(case):
     for i, trophy in enumerate(trophies):
         pts = []
         ppts = []
+        epts = []
         for j, read in enumerate(kept):
             rates = read.get("rates", [])
             rate = rates[i] if i < len(rates) else None
@@ -140,7 +165,18 @@ def forecast(case):
             nplayers = read.get("players_tracked")
             if isinstance(nplayers, (int, float)) and nplayers > 0:
                 ppts.append((math.log(float(nplayers)), value, weights[j]))
+                epts.append((xs[j], math.log(float(rate) / 100.0 * float(nplayers) + 0.5), weights[j]))
+        if pts:
+            latest_hours = max(math.expm1(x) for x, _, _ in pts)
+            def recency(point):
+                x, value, point_weight = point
+                factor = 0.5 ** ((latest_hours - math.expm1(x)) / 48.0)
+                return x, value, point_weight * factor
+            pts = [recency(point) for point in pts]
+            epts = [recency(point) for point in epts]
         pts = choose_window(pts)
+        window_xs = {x for x, _, _ in pts}
+        epts = [point for point in epts if point[0] in window_xs]
         a, b, resid, se = weighted_line(pts)
         linear_pts = [(math.expm1(x), value, weight) for x, value, weight in pts]
         linear_a, linear_b, linear_resid, _ = weighted_line(linear_pts)
@@ -153,7 +189,7 @@ def forecast(case):
             last_value = None
         per_trophy.append({"points": pts, "a": a, "b": b, "resid": resid, "se": se,
                            "linear_a": linear_a, "linear_b": linear_b, "linear_resid": linear_resid,
-                           "last": last_value, "ppts": ppts})
+                           "last": last_value, "ppts": ppts, "earner_points": epts})
         if len(pts) >= 2:
             slopes.append(b)
             linear_slopes.append(linear_b)
@@ -185,13 +221,33 @@ def forecast(case):
             # Log-time fits decelerating growth; linear-time fits a steady per-hour logit climb. Extrapolate with the better-fitting transform.
             use_linear = model["linear_resid"] < model["resid"]
             picked_move = linear_move if use_linear else time_move
+            if len(model["earner_points"]) >= 3:
+                earner = model["earner_points"]
+                _, earner_b, earner_resid, _ = weighted_line(earner)
+                earner_linear = [(math.expm1(x), value, point_weight) for x, value, point_weight in earner]
+                _, earner_linear_b, earner_linear_resid, _ = weighted_line(earner_linear)
+                earner_move = (earner_linear_b * hours_ahead if earner_linear_resid < earner_resid
+                               else earner_b * dx)
+                earner_move -= math.log(predicted_players) - math.log(last_players)
+                picked_move = 0.5 * (picked_move + earner_move)
             blended_move = picked_move
+            player_move = 0.0
             if len(model["ppts"]) >= 4 and varied_players:
                 _, pb, _, _ = weighted_line(model["ppts"])
                 player_move = pb * (math.log(predicted_players) - math.log(last_players))
                 blended_move = 0.5 * (picked_move + player_move)
-            # Chosen for robustness across synthetic scenarios, not fitted to one seed.
-            median_value = last + (1.00 if use_linear else 0.35) * blended_move
+            ceiling_points = [(math.expm1(x) / 24.0, logistic(value), point_weight)
+                              for x, value, point_weight in pts]
+            ceiling = fit_ceiling(ceiling_points, max(0.0, math.expm1(target_x) / 24.0)) if n >= 4 else None
+            ceiling_wins = ceiling is not None and ceiling[4] < (model["linear_resid"] if use_linear else model["resid"])
+            if ceiling_wins:
+                ceiling_move = logit(ceiling[5]) - last
+                if len(model["ppts"]) >= 4 and varied_players:
+                    ceiling_move = 0.5 * (ceiling_move + player_move)
+                median_value = last + 0.55 * ceiling_move
+            else:
+                # Chosen for robustness across synthetic scenarios, not fitted to one seed.
+                median_value = last + (0.85 if use_linear else 0.35) * blended_move
 
         median_value = min(logit(99.9), max(logit(0.01), median_value))
         center = logistic(median_value)
